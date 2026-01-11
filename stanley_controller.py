@@ -3,7 +3,6 @@ from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import Point, PoseArray, Pose
-from visualization_msgs.msg import Marker
 from std_msgs.msg import Float32
 import pandas as pd
 import numpy as np
@@ -15,8 +14,8 @@ from transforms3d.euler import quat2euler, euler2quat
 CSV_PATH = '/root/sim_ws/src/f1tenth_gym_ros/racelines/FTMHalle_ws25.csv'
 K_SOFT = 1.0       # Softening constant - prevents division by zero - prevents the car from steering infinitely hard if the speed drops to zero.
 WB = 0.33          # Wheelbase - distance from front axle to rear axle
-DEFAULT_GAIN = 0.5 # Starting gain
-DEFAULT_SPEED = 5.0
+DEFAULT_GAIN = 3   # Starting gain
+DEFAULT_SPEED = 2.0
 # ---------------------
 
 class StanleyController(Node):
@@ -41,9 +40,6 @@ class StanleyController(Node):
         self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', 10) # Publishes drive commands - steering and speed
         self.odom_sub = self.create_subscription(Odometry, '/ego_racecar/odom', self.drive_callback, 10)    #listens to the car's odometry - position and orientation, runs drive_callback when a new message arrives
         
-        # Visualization
-        # self.marker_pub = self.create_publisher(Marker, '/stanley_target', 10)
-        # self.path_pub = self.create_publisher(PoseArray, '/viz_path', 10)
 
         # RL Interface
         # Listen for new K_GAIN commands
@@ -51,8 +47,7 @@ class StanleyController(Node):
         # Report current error to the RL Agent
         self.error_pub = self.create_publisher(Float32, '/rl/error', 10)    # publishes the current cross-track error to the RL agent
 
-        # 4. Draw the track arrows once at startup
-        # self.publish_path_viz()
+
 
     def gain_callback(self, msg):
         """Updates the control gain when the RL agent sends a command"""
@@ -79,7 +74,6 @@ class StanleyController(Node):
         target_idx = np.argmin(dists)
         target_pt = self.waypoints[target_idx]
         
-        self.publish_marker(target_pt[0], target_pt[1])
 
         # B. Calculate Errors
         # 1. Heading Error
@@ -95,14 +89,14 @@ class StanleyController(Node):
         # Project vector onto car's lateral axis
         cte = -math.sin(car_yaw)*dx + math.cos(car_yaw)*dy
         
-        # --- PUBLISH ERROR FOR RL ---
+        # PUBLISH ERROR FOR RL
         error_msg = Float32()
         error_msg.data = abs(cte) # Publish magnitude
         self.error_pub.publish(error_msg)
-        # ----------------------------
+
 
         # C. Stanley Control Law
-        # Uses self.k_gain (dynamic) instead of K_GAIN (static)
+        # Uses self.k_gain (dynamic)
         crosstrack_term = math.atan2(self.k_gain * cte, self.speed + K_SOFT)
         steering_angle = heading_error + crosstrack_term
 
@@ -115,42 +109,6 @@ class StanleyController(Node):
         drive_msg.drive.speed = float(self.speed)
         self.drive_pub.publish(drive_msg)
 
-    def publish_marker(self, x, y):
-        """Draws a green dot at the target waypoint"""
-        marker = Marker()
-        marker.header.frame_id = "map"
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        marker.pose.position.x = x
-        marker.pose.position.y = y
-        marker.scale.x = 0.2
-        marker.scale.y = 0.2
-        marker.scale.z = 0.2
-        marker.color.a = 1.0
-        marker.color.g = 1.0 # Green
-        self.marker_pub.publish(marker)
-
-    def publish_path_viz(self):
-        """Draws Red Arrows along the track path in RViz"""
-        pa = PoseArray()
-        pa.header.frame_id = "map"
-        
-        # Downsample: Draw every 5th arrow to save FPS
-        for i in range(0, len(self.waypoints), 5):
-            pt = self.waypoints[i]
-            pose = Pose()
-            pose.position.x = pt[0]
-            pose.position.y = pt[1]
-            
-            # Convert Yaw to Quaternion
-            q = euler2quat(0, 0, pt[2])
-            pose.orientation.w = q[0]
-            pose.orientation.x = q[1]
-            pose.orientation.y = q[2]
-            pose.orientation.z = q[3]
-            pa.poses.append(pose)
-            
-        self.path_pub.publish(pa)
 
 def main(args=None):
     rclpy.init(args=args)
