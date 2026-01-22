@@ -2,120 +2,172 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from ackermann_msgs.msg import AckermannDriveStamped
-from geometry_msgs.msg import Point, PoseArray, Pose
 from std_msgs.msg import Float32
 import pandas as pd
 import numpy as np
 import math
 import os
-from transforms3d.euler import quat2euler, euler2quat
+from transforms3d.euler import quat2euler
 
-# --- CONFIGURATION ---
-CSV_PATH = '/root/sim_ws/src/f1tenth_gym_ros/racelines/FTMHalle_ws25.csv'
-K_SOFT = 1.0       # Softening constant - prevents division by zero - prevents the car from steering infinitely hard if the speed drops to zero.
-WB = 0.33          # Wheelbase - distance from front axle to rear axle
-DEFAULT_GAIN = 3   # Starting gain
-DEFAULT_SPEED = 2.0
-# ---------------------
+# ================= CONFIG =================
+CSV_PATH = '/root/sim_ws/src/f1tenth_gym_ros/racelines/Spielberg_map.csv'
+WB = 0.33
+K_SOFT = 1.0
+
+# Nominal tuning
+K_BASE = 1.2
+K_CURV = 2.0
+V_MAX = 5.0
+V_MIN = 1.0
+V_ALPHA = 3.0
+
+# RL correction limits
+K_CORR_SCALE = 0.2     # ±20%
+V_CORR_SCALE = 1.0     # ±100%
+
+# Rate limits
+DK_MAX = 0.03
+DV_MAX = 0.30
+
+STEER_LIMIT = 0.4
+
+CURV_LOOKAHEAD_DIST = 3.0  # meters
+CURV_DEADZONE = 0.07  # tune this
+# =========================================
+
+def wrap_angle(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
 
 class StanleyController(Node):
     def __init__(self):
         super().__init__('stanley_controller')
-        
-        # 1. Load Waypoints
+
         if not os.path.exists(CSV_PATH):
-            self.get_logger().error(f"CSV file not found: {CSV_PATH}")
+            self.get_logger().error("Missing raceline")
             return
-            
+
         df = pd.read_csv(CSV_PATH)
-        self.waypoints = df[['x', 'y', 'yaw', 'speed']].values
-        self.get_logger().info(f"Loaded {len(self.waypoints)} waypoints.")
+        self.waypoints = df[['x', 'y', 'yaw']].values
 
-        # 2. Dynamic Control Variables (Tunable by RL)
-        self.k_gain = DEFAULT_GAIN 
-        self.speed = DEFAULT_SPEED
+        # RL corrections (Δk, Δv) in [-1, 1]
+        self.dk = 0.0
+        self.dv = 0.0
 
-        # 3. Publishers & Subscribers
-        # Driving
-        self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', 10) # Publishes drive commands - steering and speed
-        self.odom_sub = self.create_subscription(Odometry, '/ego_racecar/odom', self.drive_callback, 10)    #listens to the car's odometry - position and orientation, runs drive_callback when a new message arrives
-        
+        self.k_prev = K_BASE
+        self.v_prev = V_MIN
 
-        # RL Interface
-        # Listen for new K_GAIN commands
-        self.gain_sub = self.create_subscription(Float32, '/rl/k_gain', self.gain_callback, 10)    # listens for new K_GAIN commands from the RL agent
-        # Report current error to the RL Agent
-        self.error_pub = self.create_publisher(Float32, '/rl/error', 10)    # publishes the current cross-track error to the RL agent
+        self.curv_baseline = np.mean([
+            self.lookahead_curvature(i)
+            for i in range(0, len(self.waypoints), 10)
+        ])
 
 
+        # Publishers
+        self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', 10)
+        self.cte_pub = self.create_publisher(Float32, '/rl/cte', 10)
+        self.heading_pub = self.create_publisher(Float32, '/rl/heading', 10)
+        self.curv_pub = self.create_publisher(Float32, '/rl/curvature', 10)
 
-    def gain_callback(self, msg):
-        """Updates the control gain when the RL agent sends a command"""
-        self.k_gain = msg.data
-        #Print to verify connection
-        self.get_logger().info(f"RL Set Gain: {self.k_gain:.2f}")
+        # Subscribers
+        self.create_subscription(Odometry, '/ego_racecar/odom', self.drive_cb, 10)
+        self.create_subscription(Float32, '/rl/dk', self.dk_cb, 10)
+        self.create_subscription(Float32, '/rl/dv', self.dv_cb, 10)
 
-    def drive_callback(self, msg):
-        # Extract Car Position - it is the position of the rear axle
-        pos_x = msg.pose.pose.position.x
-        pos_y = msg.pose.pose.position.y
-        
-        # Extract Car Orientation (Yaw)
+    def dk_cb(self, msg):
+        self.dk = float(np.clip(msg.data, -1.0, 1.0))
+
+    def dv_cb(self, msg):
+        self.dv = float(np.clip(msg.data, -1.0, 1.0))
+    
+    
+    def lookahead_curvature(self, start_idx):
+        n = len(self.waypoints)
+
+        dist_accum = 0.0
+        idx = start_idx
+
+        # start heading
+        yaw0 = self.waypoints[idx % n][2]
+
+        # walk forward until lookahead distance
+        while dist_accum < CURV_LOOKAHEAD_DIST:
+            p_curr = self.waypoints[idx % n][:2]
+            p_next = self.waypoints[(idx + 1) % n][:2]
+            dist_accum += np.linalg.norm(p_next - p_curr)
+            idx += 1
+
+        yaw1 = self.waypoints[idx % n][2]
+
+        dtheta = abs(wrap_angle(yaw1 - yaw0))
+
+        if dist_accum < 1e-3:
+            return 0.0
+
+        return dtheta / dist_accum
+
+
+    def drive_cb(self, msg):
+        pos = msg.pose.pose.position
         q = msg.pose.pose.orientation
-        _, _, car_yaw = quat2euler([q.w, q.x, q.y, q.z])
+        _, _, yaw = quat2euler([q.w, q.x, q.y, q.z])
 
-        # A. Find the Closest Waypoint (Target)
-        # Front Axle Position
-        front_x = pos_x + WB * math.cos(car_yaw)
-        front_y = pos_y + WB * math.sin(car_yaw)
+        fx = pos.x + WB * math.cos(yaw)
+        fy = pos.y + WB * math.sin(yaw)
 
-        # Calculate distance to all points
-        dists = np.sum((self.waypoints[:, :2] - np.array([front_x, front_y]))**2, axis=1)
-        target_idx = np.argmin(dists)
-        target_pt = self.waypoints[target_idx]
-        
+        dists = np.sum((self.waypoints[:, :2] - [fx, fy]) ** 2, axis=1)
+        idx = int(np.argmin(dists))
+        wp = self.waypoints[idx]
 
-        # B. Calculate Errors
-        # 1. Heading Error
-        track_yaw = target_pt[2]
-        heading_error = track_yaw - car_yaw
-        while heading_error > math.pi: heading_error -= 2*math.pi
-        while heading_error < -math.pi: heading_error += 2*math.pi
+        heading_err = wp[2] - yaw
+        heading_err = math.atan2(math.sin(heading_err), math.cos(heading_err))
 
-        # 2. Cross Track Error (CTE)
-        dx = target_pt[0] - front_x
-        dy = target_pt[1] - front_y
-        
-        # Project vector onto car's lateral axis
-        cte = -math.sin(car_yaw)*dx + math.cos(car_yaw)*dy
-        
-        # PUBLISH ERROR FOR RL
-        error_msg = Float32()
-        error_msg.data = abs(cte) # Publish magnitude
-        self.error_pub.publish(error_msg)
+        dx = wp[0] - fx
+        dy = wp[1] - fy
+        cte = -math.sin(yaw) * dx + math.cos(yaw) * dy
+
+        curvature = self.lookahead_curvature(idx)
+
+        # Publish RL signals
+        self.cte_pub.publish(Float32(data=cte))
+        self.heading_pub.publish(Float32(data=heading_err))
+        self.curv_pub.publish(Float32(data=curvature))
+
+        # ---------- Nominal schedule ----------
+        k_nom = K_BASE + K_CURV * curvature
+        effective_curv = max(curvature - self.curv_baseline, 0.0)
+        v_nom = V_MAX * math.exp(-V_ALPHA * effective_curv)
+        v_nom = np.clip(v_nom, V_MIN, V_MAX)
+
+        # ---------- RL corrections ----------
+        k_cmd = k_nom * (1.0 + K_CORR_SCALE * self.dk)
+        v_cmd = v_nom * (1.0 + V_CORR_SCALE * self.dv)
+
+        # ---------- Rate limiting ----------
+        k = self.k_prev + np.clip(k_cmd - self.k_prev, -DK_MAX, DK_MAX)
+        # Faster accel on straights, slower in corners
+        dv_max = DV_MAX * (1.0 + 2.0 * max(0.0, CURV_DEADZONE - curvature))
+        v = self.v_prev + np.clip(v_cmd - self.v_prev, -dv_max, dv_max)
+
+        self.k_prev = k
+        self.v_prev = v
+
+        steer = heading_err + math.atan2(k * cte, v + K_SOFT)
+        steer = float(np.clip(steer, -STEER_LIMIT, STEER_LIMIT))
+
+        drive = AckermannDriveStamped()
+        drive.drive.steering_angle = steer
+        drive.drive.speed = float(v)
+        self.drive_pub.publish(drive)
 
 
-        # C. Stanley Control Law
-        # Uses self.k_gain (dynamic)
-        crosstrack_term = math.atan2(self.k_gain * cte, self.speed + K_SOFT)
-        steering_angle = heading_error + crosstrack_term
-
-        # Clamp limits
-        steering_angle = max(min(steering_angle, 0.4), -0.4)
-
-        # D. Publish Drive Command
-        drive_msg = AckermannDriveStamped()
-        drive_msg.drive.steering_angle = steering_angle
-        drive_msg.drive.speed = float(self.speed)
-        self.drive_pub.publish(drive_msg)
-
-
-def main(args=None):
-    rclpy.init(args=args)
+def main():
+    rclpy.init()
     node = StanleyController()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

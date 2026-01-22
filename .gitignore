@@ -1,1 +1,13 @@
+# Python
 __pycache__/
+*.pyc
+
+# RL / logs
+runs/
+wandb/
+
+# ROS
+log/
+
+# OS
+.DS_Store
